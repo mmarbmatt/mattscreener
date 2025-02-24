@@ -64,7 +64,7 @@ def format_num(val, decimals=3):
     except Exception:
         return str(val)
 
-# --- Rate Limiter for Coinbase requests ---
+# --- Rate Limiter for Exchange requests ---
 class RateLimiter:
     def __init__(self, rate, per):
         self._rate = rate      # e.g. 10 tokens per 'per' seconds
@@ -460,13 +460,19 @@ class MultiScreener:
         self.tape_queue = asyncio.Queue()
         self.update_task = None  # Will be set when sources are defined.
         self.proxy = None  # Active proxy URL, if any
-        self.coinbase_rate_limiter = RateLimiter(rate=10, per=1)  # Added rate limiter for coinbase requests
+        # Rate limiters for each exchange
+        self.rate_limiters = {
+            'coinbase': RateLimiter(rate=10, per=1),  # 10 req/s public
+            'htx': RateLimiter(rate=100, per=10),     # 100 req/10s public
+            'bybitperps': RateLimiter(rate=120, per=60),  # 120 req/min public REST
+            'binanceperps': RateLimiter(rate=1200, per=60),  # 1200 req/min public (weight-based, adjusted)
+            'binancespot': RateLimiter(rate=1200, per=60)  # 1200 req/min public (weight-based, adjusted)
+        }
 
-    # Do not connect until sources are specified.
     async def set_sources(self, sources_arg):
-        valid_options = ["htx", "coinbase", "all"]
+        valid_options = ["htx", "coinbase", "bybitperps", "binanceperps", "binancespot", "all"]
         if sources_arg.lower() not in valid_options:
-            print(colored(f"Invalid source '{sources_arg}'. Valid options: htx, coinbase, all.", fg='red'))
+            print(colored(f"Invalid source '{sources_arg}'. Valid options: htx, coinbase, bybitperps, binanceperps, binancespot, all.", fg='red'))
             return
 
         # Close existing connections if any.
@@ -480,7 +486,7 @@ class MultiScreener:
         self.selected_sources.clear()
 
         if sources_arg.lower() == "all":
-            srcs = ["coinbase", "htx"]
+            srcs = ["coinbase", "htx", "bybitperps", "binanceperps", "binancespot"]
         else:
             srcs = [sources_arg.lower()]
 
@@ -494,30 +500,51 @@ class MultiScreener:
                 ex = ccxt.htx(options)
             elif src == "coinbase":
                 ex = ccxt.coinbase(options)
+            elif src == "bybitperps":
+                ex = ccxt.bybit({
+                    'options': {
+                        'defaultType': 'future',
+                        'category': 'linear'  # Explicitly set to linear for USDT perpetuals
+                    }
+                } | options)
+                ex.urls['api']['public'] = 'https://api.bybit.com'  # Base v5 API URL, CCXT appends endpoints
+            elif src == "binanceperps":
+                ex = ccxt.binance({'options': {'defaultType': 'future'}} | options)
+                ex.urls['api']['public'] = 'https://fapi.binance.com/fapi/v1'  # Correct futures endpoint
+            elif src == "binancespot":
+                ex = ccxt.binance(options)
+                ex.urls['api']['public'] = 'https://api.binance.com/api/v3'  # Correct spot endpoint
             else:
                 print(colored(f"Unknown source '{src}'. Skipping.", fg='red'))
                 continue
             try:
                 markets = await ex.load_markets()
+                all_symbols = list(markets.keys())
+                filtered_symbols = []
+                for symbol in all_symbols:
+                    info = markets[symbol].get('info', {})
+                    if "/USDT" in symbol and markets[symbol].get('active', True):
+                        if src in ['bybitperps', 'binanceperps']:
+                            if markets[symbol].get('contract', False) and 'linear' in markets[symbol].get('type', ''):
+                                filtered_symbols.append(symbol)
+                        elif src == 'binancespot':
+                            if not markets[symbol].get('contract', False):
+                                filtered_symbols.append(symbol)
+                        else:
+                            filtered_symbols.append(symbol)
+                self.exchanges[src] = ex
+                self.symbols[src] = filtered_symbols
+                print(colored(f"Loaded {len(all_symbols)} symbols from {src.upper()}.", fg='cyan', style='bold'))
+                print(colored(f"Filtered to {len(filtered_symbols)} active USDT symbols for {src.upper()}.", fg='cyan', style='bold'))
             except Exception as e:
                 print(colored(f"Error loading markets for {src}: {e}", fg='red'))
+                try:
+                    await ex.close()
+                except Exception as close_e:
+                    print(colored(f"Error closing {src} exchange: {close_e}", fg='red'))
                 continue
-            all_symbols = list(markets.keys())
-            filtered_symbols = []
-            for symbol in all_symbols:
-                info = markets[symbol].get('info', {})
-                if "/USDT" in symbol:
-                    if 'state' in info:
-                        if info['state'].upper() == 'TRADING':
-                            filtered_symbols.append(symbol)
-                    else:
-                        filtered_symbols.append(symbol)
-            self.exchanges[src] = ex
-            self.symbols[src] = filtered_symbols
-            print(colored(f"Loaded {len(all_symbols)} symbols from {src.upper()}.", fg='cyan', style='bold'))
-            print(colored(f"Filtered to {len(filtered_symbols)} active USDT symbols for {src.upper()}.", fg='cyan', style='bold'))
-        # Start the update loop if not already running.
-        if self.update_task is None:
+        # Start the update loop if not already running and there are valid sources.
+        if self.exchanges and self.update_task is None:
             self.update_task = asyncio.create_task(self.update_loop())
 
     async def update_loop(self):
@@ -526,6 +553,8 @@ class MultiScreener:
             tasks = []
             for src in self.selected_sources:
                 exchange = self.exchanges.get(src)
+                if not exchange:
+                    continue
                 syms = self.symbols.get(src, [])
                 for symbol in syms:
                     tasks.append(self.fetch_data_for_symbol(src, symbol, semaphore))
@@ -541,16 +570,18 @@ class MultiScreener:
 
             max_retries = 5
             base_delay = 1
+            rate_limiter = self.rate_limiters.get(src)
 
             for attempt in range(max_retries):
                 try:
+                    await rate_limiter.acquire()
                     now = exchange.milliseconds()
                     ticker = await exchange.fetch_ticker(symbol)
                     last_price = ticker.get('last')
                     vol_24h = ticker.get('quoteVolume') or ticker.get('baseVolume') or 0
                     info = ticker.get('info', {})
-                    funding = info.get('fundingRate')
-                    oi = info.get('openInterest')
+                    funding = info.get('fundingRate') if src in ['bybitperps', 'binanceperps'] else None
+                    oi = info.get('openInterest') if src in ['bybitperps', 'binanceperps'] else None
                     try:
                         ohlcv_5m = await exchange.fetch_ohlcv(symbol, timeframe='5m', limit=2)
                         if len(ohlcv_5m) >= 2:
@@ -608,19 +639,12 @@ class MultiScreener:
                         'volume_delta_1h': volume_delta_1h,
                         'timestamp': now
                     }
-
-                    if src == "coinbase":
-                        await asyncio.sleep(random.uniform(0.5, 1.5))
                     return
 
                 except ccxt.RateLimitExceeded:
-                    if src == "coinbase":
-                        wait_time = base_delay * (2 ** attempt) + random.uniform(0, 1)
-                        print(colored(f"[Rate Limited] Retrying {src}:{symbol} in {wait_time:.2f}s", fg='yellow'))
-                        await asyncio.sleep(wait_time)
-                    else:
-                        print(colored(f"[Unexpected Rate Limit] {src}:{symbol}", fg='red'))
-                        await asyncio.sleep(2)
+                    wait_time = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    print(colored(f"[Rate Limited] Retrying {src}:{symbol} in {wait_time:.2f}s", fg='yellow'))
+                    await asyncio.sleep(wait_time)
                 except ccxt.NetworkError as e:
                     print(colored(f"[Network Error] {src}:{symbol}: {e}", fg='red'))
                     await asyncio.sleep(2)
@@ -765,8 +789,7 @@ async def tape_printer(screener):
 async def fetch_and_print_trades(src, sym, exchange, last_trade_ids, feed_start, semaphore, screener):
     async with semaphore:
         async def fetch_regular():
-            if src == 'coinbase':
-                await screener.coinbase_rate_limiter.acquire()
+            await screener.rate_limiters[src].acquire()
             try:
                 trades = await exchange.fetch_trades(sym)
                 return trades
@@ -776,8 +799,9 @@ async def fetch_and_print_trades(src, sym, exchange, last_trade_ids, feed_start,
                 return []
 
         async def fetch_liquidation():
-            if src == 'coinbase':
-                await screener.coinbase_rate_limiter.acquire()
+            if src not in ['bybitperps', 'binanceperps']:
+                return []
+            await screener.rate_limiters[src].acquire()
             try:
                 liq_trades = await exchange.fetch_trades(sym, params={'liquidation': True})
                 for t in liq_trades:
@@ -871,7 +895,16 @@ async def tape_feed(pair, screener):
 
     feed_start = {}
     for src in feed_sources:
-        feed_start[src] = screener.exchanges[src].milliseconds()
+        exchange = screener.exchanges.get(src)
+        if exchange:
+            feed_start[src] = exchange.milliseconds()
+        else:
+            print(colored(f"Skipping {src} in tape feed due to no exchange instance.", fg='yellow'))
+            del feed_sources[src]
+    if not feed_sources:
+        print(colored("No valid sources available for tape feed.", fg='red'))
+        return
+
     print(colored("Starting live tape feed for:", fg='cyan', style='bold'))
     for src, syms in feed_sources.items():
         print(colored(f" {src.upper()}: " + ", ".join([format_symbol(sym) for sym in syms]), fg='cyan'))
@@ -880,12 +913,13 @@ async def tape_feed(pair, screener):
         for sym in syms:
             last_trade_ids[f"{src}:{sym}"] = None
 
-    semaphores = {}
-    for src in feed_sources:
-        if src == "coinbase":
-            semaphores[src] = asyncio.Semaphore(5)
-        else:
-            semaphores[src] = asyncio.Semaphore(1000)
+    semaphores = {
+        'coinbase': asyncio.Semaphore(5),
+        'htx': asyncio.Semaphore(50),
+        'bybitperps': asyncio.Semaphore(20),
+        'binanceperps': asyncio.Semaphore(50),
+        'binancespot': asyncio.Semaphore(50)
+    }
 
     try:
         while True:
@@ -918,8 +952,8 @@ async def command_loop(screener):
                 continue
             if parts[0] == 'help':
                 print(colored("\nCommands:", fg='cyan', style='bold'))
-                print(" sources <htx|coinbase|all>    - Set the data source(s).")
-                print(" info <pair>                   - Show info for a specific pair. (Prefix with source if needed: coinbase:BTC/USDT)")
+                print(" sources <htx|coinbase|bybitperps|binanceperps|binancespot|all> - Set the data source(s).")
+                print(" info <pair>                   - Show info for a specific pair. (Prefix with source if needed: bybitperps:BTC/USDT)")
                 print(" info funding up|down          - Show funding ranking (up: highest first, down: lowest first).")
                 print(" display <metric>              - Continuously display all metrics sorted by the given metric.")
                 print("    (Valid metrics: price, change_5m_up, change_5m_down, tps, tps_5m, spread,")
@@ -929,19 +963,19 @@ async def command_loop(screener):
                 print(" tape <pair|all>               - Start live tape feed for a pair or all pairs. (Prefix pair with source if desired)")
                 print(" tape stop                     - Stop the live tape feed.")
                 print(" displayfull stop              - Stop the full-screen display.")
-                print(" mmscan                      - Start continuously scanning market conditions (full-screen, non-scrolling).")
-                print(" mmscan stop                 - Stop the market conditions scan.")
+                print(" mmscan                        - Start continuously scanning market conditions (full-screen, non-scrolling).")
+                print(" mmscan stop                   - Stop the market conditions scan.")
                 print(" proxy <usa|japan> <number|best> - Set proxy for the given region by number or choose the best connection.")
-                print(" proxy list                  - List available proxies with ping times.")
-                print(" proxy off                   - Disable the current proxy.")
-                print(" exit                        - Exit the screener.\n")
+                print(" proxy list                    - List available proxies with ping times.")
+                print(" proxy off                     - Disable the current proxy.")
+                print(" exit                          - Exit the screener.\n")
             elif parts[0] == 'sources':
                 if len(parts) == 2:
                     new_src = parts[1]
                     await screener.set_sources(new_src)
                     print(colored(f"Data source(s) set to: {', '.join(screener.selected_sources)}", fg='cyan', style='bold'))
                 else:
-                    print(colored("Usage: sources <htx|coinbase|all>", fg='red'))
+                    print(colored("Usage: sources <htx|coinbase|bybitperps|binanceperps|binancespot|all>", fg='red'))
             elif parts[0] == 'info':
                 if len(parts) == 2:
                     display_info(parts[1], screener)
