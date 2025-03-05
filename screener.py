@@ -463,8 +463,8 @@ class MultiScreener:
         self.oi_history = {}
         self.market_data = {}
         self.trade_history = {}
-        self.trade_history_cvd = {}
-        self.cvd_data = {}  # To store the latest CVD DataFrame for each symbol_key
+        self.cvd_resampled = {}  # Resampled CVD data at 100ms intervals
+        self.cvd_data = {}  # To store the latest CVD DataFrame with rolling means
         self.tape_queue = asyncio.Queue()
         self.update_task = None
         self.proxy = None
@@ -531,14 +531,15 @@ class MultiScreener:
                 self.symbol_info[src] = {}
                 for symbol in all_symbols:
                     market = markets[symbol]
-                    if market.get('active', True):
+                    # Exclude options markets
+                    if market.get('active', True) and market['type'] != 'option':
                         base = market['base']
                         quote = market['quote']
                         self.symbol_info[src][symbol] = {'base': base, 'quote': quote}
                         self.symbols[src].append(symbol)
                 self.exchanges[src] = ex
                 print(colored(f"Loaded {len(all_symbols)} symbols from {src.upper()}.", fg='cyan', style='bold'))
-                print(colored(f"Filtered to {len(self.symbols[src])} active symbols for {src.upper()}.", fg='cyan', style='bold'))
+                print(colored(f"Filtered to {len(self.symbols[src])} active symbols (no options) for {src.upper()}.", fg='cyan', style='bold'))
             except Exception as e:
                 print(colored(f"Error loading markets for {src}: {e}", fg='red'))
                 try:
@@ -682,20 +683,14 @@ class MultiScreener:
     def get_all_data(self):
         return self.market_data
 
-    def get_cvd_data(self, symbol_key, timeframe_minutes):
-        trades = self.trade_history_cvd.get(symbol_key, [])
-        if not trades:
+    def get_cvd_data(self, symbol_key):
+        """Compute CVD with 1-minute and 15-minute rolling means from resampled data."""
+        if symbol_key not in self.cvd_resampled:
             return None
-        df = pd.DataFrame(trades, columns=['timestamp', 'side', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df = df.set_index('timestamp')
-        df['buy_volume'] = df['volume'].where(df['side'] == 'buy', 0)
-        df['sell_volume'] = df['volume'].where(df['side'] == 'sell', 0)
-        df['delta'] = df['buy_volume'] - df['sell_volume']
-        df['cvd'] = df['delta'].cumsum()
-        rolling_window = f'{timeframe_minutes}min'
-        df[f'cvd_{timeframe_minutes}m'] = df['cvd'].rolling(rolling_window, min_periods=1).mean()
-        self.cvd_data[symbol_key] = df  # Store the DataFrame
+        df = self.cvd_resampled[symbol_key].copy()
+        df['cvd_1m'] = df['cvd'].rolling('1min', min_periods=1).mean()
+        df['cvd_15m'] = df['cvd'].rolling('15min', min_periods=1).mean()
+        self.cvd_data[symbol_key] = df
         return df
 
 # --- Other Command Functions ---
@@ -863,7 +858,7 @@ async def fetch_and_print_trades(src, sym, exchange, last_trade_ids, feed_start,
                 trade_timestamp = trade['timestamp']
                 ts = datetime.datetime.fromtimestamp(trade_timestamp / 1000).strftime('%Y-%m-%d %H:%M:%S')
                 price = trade['price']
-                amount = trade['amount']
+                amount = trade['volume'] if trade.get('volume') is not None else trade['amount']
                 try:
                     usd_value = float(price) * float(amount)
                 except Exception:
@@ -875,18 +870,46 @@ async def fetch_and_print_trades(src, sym, exchange, last_trade_ids, feed_start,
                 screener.trade_history[key].append((now_ms, usd_value))
                 thirty_min_ago = now_ms - (30 * 60 * 1000)
                 screener.trade_history[key] = [(t, v) for t, v in screener.trade_history[key] if t >= thirty_min_ago]
-                if key not in screener.trade_history_cvd:
-                    screener.trade_history_cvd[key] = []
-                screener.trade_history_cvd[key].append({
-                    'timestamp': trade_timestamp,
-                    'side': side,
-                    'volume': amount
-                })
-                # Truncate to keep only the most recent 500 transactions
-                if len(screener.trade_history_cvd[key]) > 500:
-                    screener.trade_history_cvd[key] = screener.trade_history_cvd[key][-500:]
-                screener.get_cvd_data(key, 15)
-                screener.get_cvd_data(key, 1)
+
+                # Update CVD resampled DataFrame (100ms bins, max 10 points per second)
+                bin_size_ms = 100  # 100ms
+                bin_ts = (trade['timestamp'] // bin_size_ms) * bin_size_ms
+                bin_ts_dt = pd.to_datetime(bin_ts, unit='ms')
+                if key not in screener.cvd_resampled:
+                    df = pd.DataFrame(columns=['buy_volume', 'sell_volume', 'delta', 'cvd'], index=[bin_ts_dt])
+                    df.loc[bin_ts_dt, 'buy_volume'] = 0.0
+                    df.loc[bin_ts_dt, 'sell_volume'] = 0.0
+                    df.loc[bin_ts_dt, 'delta'] = 0.0
+                    df.loc[bin_ts_dt, 'cvd'] = 0.0
+                    screener.cvd_resampled[key] = df
+                else:
+                    df = screener.cvd_resampled[key]
+                    if bin_ts_dt > df.index[-1]:
+                        new_row = pd.DataFrame(index=[bin_ts_dt], data={'buy_volume': 0.0, 'sell_volume': 0.0, 'delta': 0.0, 'cvd': df['cvd'].iloc[-1]})
+                        df = pd.concat([df, new_row])
+                        screener.cvd_resampled[key] = df
+                    elif bin_ts_dt < df.index[-1]:
+                        print(colored(f"Warning: trade timestamp {bin_ts_dt} is before last bin {df.index[-1]} for {key}", fg='yellow'))
+                        continue  # Skip this trade
+                # Update volumes
+                if trade['side'] == 'buy':
+                    df.loc[bin_ts_dt, 'buy_volume'] += amount
+                elif trade['side'] == 'sell':
+                    df.loc[bin_ts_dt, 'sell_volume'] += amount
+                df.loc[bin_ts_dt, 'delta'] = df.loc[bin_ts_dt, 'buy_volume'] - df.loc[bin_ts_dt, 'sell_volume']
+                # Update CVD
+                if bin_ts_dt == df.index[0]:
+                    df.loc[bin_ts_dt, 'cvd'] = df.loc[bin_ts_dt, 'delta']
+                else:
+                    prev_cvd = df['cvd'].shift(1).loc[bin_ts_dt]
+                    df.loc[bin_ts_dt, 'cvd'] = prev_cvd + df.loc[bin_ts_dt, 'delta']
+                # Remove data older than 1 hour
+                one_hour_ago = pd.to_datetime(int(time.time() * 1000) - 3600 * 1000, unit='ms')
+                df = df[df.index >= one_hour_ago]
+                screener.cvd_resampled[key] = df
+                # Update cvd_data with rolling means
+                screener.get_cvd_data(key)
+
                 if screener.trade_history[key]:
                     avg_usd = sum(v for t, v in screener.trade_history[key]) / len(screener.trade_history[key])
                 else:
@@ -1185,7 +1208,7 @@ async def command_loop(screener):
                     else:
                         if ':' in pair:
                             key = pair
-                            if key in screener.trade_history_cvd:
+                            if key in screener.cvd_resampled:
                                 target_keys = [key]
                             else:
                                 print(colored(f"No trade data for {key}", fg='red'))
