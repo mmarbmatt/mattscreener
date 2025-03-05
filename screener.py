@@ -3,20 +3,26 @@ import sys
 import asyncio
 import datetime, os, time, threading, math
 import random
-import requests  # Added for proxy testing and usage
+import requests
+import ccxt.async_support as ccxt
+from colorama import Fore, Style, init
+import curses
+import matplotlib.pyplot as plt
+import pandas as pd
+from matplotlib.animation import FuncAnimation
+import queue
 
 # On Windows, use the SelectorEventLoopPolicy.
 if sys.platform.startswith('win'):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-import ccxt.async_support as ccxt
-from colorama import Fore, Style, init
-import curses
+# Force TkAgg backend for Windows compatibility
+plt.switch_backend('TkAgg')
 
 # Initialize colorama.
 init(autoreset=True)
 
-# ANSI escape code for orange (if not available in colorama)
+# ANSI escape code for orange
 ORANGE = "\033[38;5;208m"
 
 def colored(text, fg='white', style='normal'):
@@ -64,10 +70,17 @@ def format_num(val, decimals=3):
     except Exception:
         return str(val)
 
+def typing_animation(text, delay=0.05):
+    for char in text:
+        sys.stdout.write(char)
+        sys.stdout.flush()
+        time.sleep(delay)
+    print()
+
 # --- Rate Limiter for Exchange requests ---
 class RateLimiter:
     def __init__(self, rate, per):
-        self._rate = rate      # e.g. 10 tokens per 'per' seconds
+        self._rate = rate
         self._per = per
         self._tokens = rate
         self._last = asyncio.get_event_loop().time()
@@ -129,7 +142,6 @@ def get_best_proxy(region):
 
 def set_active_proxy(proxy_url, screener):
     screener.proxy = proxy_url
-    # Update existing exchanges with new proxy settings
     for ex in screener.exchanges.values():
         try:
             ex.proxies = {"http": proxy_url, "https": proxy_url}
@@ -206,7 +218,7 @@ def curses_display_metric(selected_metric, screener, stop_event):
         while not stop_event.is_set():
             stdscr.clear()
             all_data = screener.get_all_data()
-            filtered_data = {k: d for k, d in all_data.items() if "/USDT" in k}
+            filtered_data = {k: d for k, d in all_data.items() if "/USDT" in k or "USDT" in k or "/USD" in k or "USD" in k}
             unique_data = {}
             for key, d in filtered_data.items():
                 source, base = display_symbol(key)
@@ -272,7 +284,7 @@ def curses_display_metric(selected_metric, screener, stop_event):
         curses.nocbreak()
         curses.endwin()
 
-# --- Full-Screen Market Conditions Scan (One Vertical Column; Skip Categories with 0 Assigned Coins) ---
+# --- Full-Screen Market Conditions Scan ---
 def curses_market_conditions_scan(screener, stop_event):
     stdscr = curses.initscr()
     curses.noecho()
@@ -281,12 +293,11 @@ def curses_market_conditions_scan(screener, stop_event):
     if curses.has_colors():
         curses.start_color()
         curses.init_pair(1, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-    header_width = 60  # skinnier header
+    header_width = 60
     try:
         while not stop_event.is_set():
             stdscr.clear()
             now = int(datetime.datetime.now().timestamp() * 1000)
-            # Use only fresh data (within 1 hour) and for active sources.
             fresh_data = {k: v for k, v in screener.get_all_data().items()
                           if (now - v.get('timestamp', 0) <= 3600 * 1000) and (k.split(":")[0] in screener.selected_sources)}
             if not fresh_data:
@@ -298,14 +309,12 @@ def curses_market_conditions_scan(screener, stop_event):
                 time.sleep(1)
                 continue
 
-            # Compute normalization values.
             vol24_values = [d.get('vol_24h', 0) for d in fresh_data.values()]
             max_vol_24h = max(vol24_values) if vol24_values else 0
             min_vol_24h = min(vol24_values) if vol24_values else 0
             max_tps_5m = max([d.get('tps_5m', 0) for d in fresh_data.values()] or [0])
             max_volatility = max([d.get('volatility', 0) for d in fresh_data.values()] or [0])
 
-            # Fixed ranking order.
             category_order = [
                 "Moderate Volatility",
                 "Sufficient Liquidity",
@@ -321,7 +330,6 @@ def curses_market_conditions_scan(screener, stop_event):
                 "Other"
             ]
 
-            # For each coin, compute scores.
             coin_eligibility = {}
             for key, d in fresh_data.items():
                 change_5m = d.get('change_5m_up', 0) if d.get('change_5m_up', 0) != 0 else d.get('change_5m_down', 0)
@@ -367,7 +375,6 @@ def curses_market_conditions_scan(screener, stop_event):
                     elig.sort(key=lambda x: category_order.index(x[0]))
                 coin_eligibility[key] = elig
 
-            # Compute assigned coins per category.
             assigned = {}
             category_assigned = {cat: [] for cat in category_order}
             unassigned = set(coin_eligibility.keys())
@@ -407,19 +414,17 @@ def curses_market_conditions_scan(screener, stop_event):
                 category_assigned["Other"].append((coin, 0))
             unassigned.clear()
 
-            # Now display only categories with >0 assigned coins in one vertical column.
             line = 0
             for i, cat in enumerate(category_order, 1):
                 assigned_coins = category_assigned.get(cat, [])
                 if len(assigned_coins) == 0:
-                    continue  # Skip category if no coin is assigned.
+                    continue
                 header = f"({i}) {cat} ({len(assigned_coins)} coin(s))"
                 try:
                     stdscr.addstr(line, 0, header.center(header_width, "-"), curses.color_pair(1) | curses.A_BOLD)
                 except curses.error:
                     pass
                 line += 1
-                # Sort assigned coins descending by score.
                 assigned_coins = sorted(assigned_coins, key=lambda x: x[1], reverse=True)
                 for coin, score in assigned_coins[:5]:
                     src, base = coin.split(":", 1)
@@ -452,21 +457,23 @@ def curses_market_conditions_scan(screener, stop_event):
 class MultiScreener:
     def __init__(self):
         self.exchanges = {}
-        self.symbols = {}
-        self.selected_sources = []  # Remains empty until "sources" command is given.
+        self.symbols = {}  # Stores active symbols for each exchange
+        self.symbol_info = {}  # Stores base and quote for each symbol
+        self.selected_sources = []
         self.oi_history = {}
         self.market_data = {}
         self.trade_history = {}
+        self.trade_history_cvd = {}
+        self.cvd_data = {}  # To store the latest CVD DataFrame for each symbol_key
         self.tape_queue = asyncio.Queue()
-        self.update_task = None  # Will be set when sources are defined.
-        self.proxy = None  # Active proxy URL, if any
-        # Rate limiters for each exchange
+        self.update_task = None
+        self.proxy = None
         self.rate_limiters = {
-            'coinbase': RateLimiter(rate=10, per=1),  # 10 req/s public
-            'htx': RateLimiter(rate=100, per=10),     # 100 req/10s public
-            'bybitperps': RateLimiter(rate=120, per=60),  # 120 req/min public REST
-            'binanceperps': RateLimiter(rate=1200, per=60),  # 1200 req/min public (weight-based, adjusted)
-            'binancespot': RateLimiter(rate=1200, per=60)  # 1200 req/min public (weight-based, adjusted)
+            'coinbase': RateLimiter(rate=10, per=1),
+            'htx': RateLimiter(rate=100, per=10),
+            'bybitperps': RateLimiter(rate=120, per=60),
+            'binanceperps': RateLimiter(rate=1200, per=60),
+            'binancespot': RateLimiter(rate=1200, per=60)
         }
 
     async def set_sources(self, sources_arg):
@@ -475,7 +482,6 @@ class MultiScreener:
             print(colored(f"Invalid source '{sources_arg}'. Valid options: htx, coinbase, bybitperps, binanceperps, binancespot, all.", fg='red'))
             return
 
-        # Close existing connections if any.
         for ex in self.exchanges.values():
             try:
                 await ex.close()
@@ -483,6 +489,7 @@ class MultiScreener:
                 pass
         self.exchanges.clear()
         self.symbols.clear()
+        self.symbol_info.clear()
         self.selected_sources.clear()
 
         if sources_arg.lower() == "all":
@@ -504,38 +511,34 @@ class MultiScreener:
                 ex = ccxt.bybit({
                     'options': {
                         'defaultType': 'future',
-                        'category': 'linear'  # Explicitly set to linear for USDT perpetuals
+                        'category': 'linear'
                     }
                 } | options)
-                ex.urls['api']['public'] = 'https://api.bybit.com'  # Base v5 API URL, CCXT appends endpoints
+                ex.urls['api']['public'] = 'https://api.bybit.com'
             elif src == "binanceperps":
                 ex = ccxt.binance({'options': {'defaultType': 'future'}} | options)
-                ex.urls['api']['public'] = 'https://fapi.binance.com/fapi/v1'  # Correct futures endpoint
+                ex.urls['api']['public'] = 'https://fapi.binance.com/fapi/v1'
             elif src == "binancespot":
                 ex = ccxt.binance(options)
-                ex.urls['api']['public'] = 'https://api.binance.com/api/v3'  # Correct spot endpoint
+                ex.urls['api']['public'] = 'https://api.binance.com/api/v3'
             else:
                 print(colored(f"Unknown source '{src}'. Skipping.", fg='red'))
                 continue
             try:
                 markets = await ex.load_markets()
                 all_symbols = list(markets.keys())
-                filtered_symbols = []
+                self.symbols[src] = []
+                self.symbol_info[src] = {}
                 for symbol in all_symbols:
-                    info = markets[symbol].get('info', {})
-                    if "/USDT" in symbol and markets[symbol].get('active', True):
-                        if src in ['bybitperps', 'binanceperps']:
-                            if markets[symbol].get('contract', False) and 'linear' in markets[symbol].get('type', ''):
-                                filtered_symbols.append(symbol)
-                        elif src == 'binancespot':
-                            if not markets[symbol].get('contract', False):
-                                filtered_symbols.append(symbol)
-                        else:
-                            filtered_symbols.append(symbol)
+                    market = markets[symbol]
+                    if market.get('active', True):
+                        base = market['base']
+                        quote = market['quote']
+                        self.symbol_info[src][symbol] = {'base': base, 'quote': quote}
+                        self.symbols[src].append(symbol)
                 self.exchanges[src] = ex
-                self.symbols[src] = filtered_symbols
                 print(colored(f"Loaded {len(all_symbols)} symbols from {src.upper()}.", fg='cyan', style='bold'))
-                print(colored(f"Filtered to {len(filtered_symbols)} active USDT symbols for {src.upper()}.", fg='cyan', style='bold'))
+                print(colored(f"Filtered to {len(self.symbols[src])} active symbols for {src.upper()}.", fg='cyan', style='bold'))
             except Exception as e:
                 print(colored(f"Error loading markets for {src}: {e}", fg='red'))
                 try:
@@ -543,9 +546,17 @@ class MultiScreener:
                 except Exception as close_e:
                     print(colored(f"Error closing {src} exchange: {close_e}", fg='red'))
                 continue
-        # Start the update loop if not already running and there are valid sources.
         if self.exchanges and self.update_task is None:
             self.update_task = asyncio.create_task(self.update_loop())
+
+    def find_symbols_by_base_quote(self, base, quote):
+        result = {}
+        for src in self.selected_sources:
+            for symbol, info in self.symbol_info.get(src, {}).items():
+                if info['base'] == base and info['quote'] == quote:
+                    result[src] = symbol
+                    break  # Assume only one symbol per base/quote per exchange
+        return result
 
     async def update_loop(self):
         semaphore = asyncio.Semaphore(10)
@@ -670,6 +681,22 @@ class MultiScreener:
 
     def get_all_data(self):
         return self.market_data
+
+    def get_cvd_data(self, symbol_key, timeframe_minutes):
+        trades = self.trade_history_cvd.get(symbol_key, [])
+        if not trades:
+            return None
+        df = pd.DataFrame(trades, columns=['timestamp', 'side', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df = df.set_index('timestamp')
+        df['buy_volume'] = df['volume'].where(df['side'] == 'buy', 0)
+        df['sell_volume'] = df['volume'].where(df['side'] == 'sell', 0)
+        df['delta'] = df['buy_volume'] - df['sell_volume']
+        df['cvd'] = df['delta'].cumsum()
+        rolling_window = f'{timeframe_minutes}min'
+        df[f'cvd_{timeframe_minutes}m'] = df['cvd'].rolling(rolling_window, min_periods=1).mean()
+        self.cvd_data[symbol_key] = df  # Store the DataFrame
+        return df
 
 # --- Other Command Functions ---
 def display_info(pair, screener):
@@ -817,7 +844,8 @@ async def fetch_and_print_trades(src, sym, exchange, last_trade_ids, feed_start,
         for trade in all_trades:
             if trade['timestamp'] < feed_start:
                 continue
-            if last_trade_ids.get(key) is None or int(trade['id']) > int(last_trade_ids[key]):
+            trade_id = int(trade['id']) if trade['id'] else 0
+            if last_trade_ids.get(key) is None or trade_id > int(last_trade_ids[key]):
                 side = trade.get('side', 'unknown').lower()
                 if side == 'buy':
                     arrow = "↑"
@@ -847,6 +875,18 @@ async def fetch_and_print_trades(src, sym, exchange, last_trade_ids, feed_start,
                 screener.trade_history[key].append((now_ms, usd_value))
                 thirty_min_ago = now_ms - (30 * 60 * 1000)
                 screener.trade_history[key] = [(t, v) for t, v in screener.trade_history[key] if t >= thirty_min_ago]
+                if key not in screener.trade_history_cvd:
+                    screener.trade_history_cvd[key] = []
+                screener.trade_history_cvd[key].append({
+                    'timestamp': trade_timestamp,
+                    'side': side,
+                    'volume': amount
+                })
+                # Truncate to keep only the most recent 500 transactions
+                if len(screener.trade_history_cvd[key]) > 500:
+                    screener.trade_history_cvd[key] = screener.trade_history_cvd[key][-500:]
+                screener.get_cvd_data(key, 15)
+                screener.get_cvd_data(key, 1)
                 if screener.trade_history[key]:
                     avg_usd = sum(v for t, v in screener.trade_history[key]) / len(screener.trade_history[key])
                 else:
@@ -855,7 +895,7 @@ async def fetch_and_print_trades(src, sym, exchange, last_trade_ids, feed_start,
                 ratio = usd_value / avg_usd if avg_usd > 0 else 1
                 num_bars = max(1, int(ratio * scale_factor))
                 bar_visual = "|" * num_bars
-                base = sym.split("/")[0]
+                base = sym.split("/")[0] if '/' in sym else sym
                 if trade.get('liquidation'):
                     if side == 'sell':
                         highlight_color = ORANGE
@@ -870,28 +910,26 @@ async def fetch_and_print_trades(src, sym, exchange, last_trade_ids, feed_start,
                     msg = colored(f"{arrow} {side_text} | {src.upper()} {base} | Price: {price} | Time: {ts} | Size: {usd_value_str} USD | {bar_visual}",
                                   fg=color_for_trade)
                 await screener.tape_queue.put((trade_timestamp, msg))
-                last_trade_ids[key] = trade['id']
+                last_trade_ids[key] = trade_id
 
 async def tape_feed(pair, screener):
-    feed_sources = {}
-    if pair.lower() == 'all':
-        for src in screener.selected_sources:
-            feed_sources[src] = screener.symbols.get(src, [])
+    if '/' in pair:
+        base, quote = pair.split('/', 1)
+        symbols_by_src = screener.find_symbols_by_base_quote(base, quote)
+        feed_sources = {}
+        for src, symbol in symbols_by_src.items():
+            feed_sources[src] = [symbol]
     else:
-        if ":" in pair:
-            src, sym = pair.split(":", 1)
-            if src in screener.selected_sources and sym in screener.symbols.get(src, []):
-                feed_sources[src] = [sym]
+        if ':' in pair:
+            src, sym = pair.split(':', 1)
+            if src in screener.selected_sources and sym in screener.symbol_info.get(src, {}):
+                feed_sources = {src: [sym]}
             else:
-                print(colored(f"Pair {pair} not found.", fg='red'))
+                print(colored(f"Invalid pair {pair}", fg='red'))
                 return
         else:
-            for src in screener.selected_sources:
-                if pair in screener.symbols.get(src, []):
-                    feed_sources.setdefault(src, []).append(pair)
-            if not feed_sources:
-                print(colored(f"Pair {pair} not found in any active source.", fg='red'))
-                return
+            print(colored("Please specify pair as base/quote (e.g., BTC/USDT) or src:symbol (e.g., htx:BTC/USDT)", fg='red'))
+            return
 
     feed_start = {}
     for src in feed_sources:
@@ -935,13 +973,94 @@ async def tape_feed(pair, screener):
     except asyncio.CancelledError:
         print(colored("\nTape feed stopped.\n", fg='yellow'))
 
+def cvd_plot_thread(screener, stop_event, target_keys):
+    plt.style.use('ggplot')
+    fig, ax = plt.subplots(figsize=(12, 6))
+    fig.patch.set_facecolor('#1a1a1a')
+    ax.set_facecolor('#2a2a2a')
+    exchange_colors = {
+        'coinbase': 'yellow',
+        'htx': 'cyan',
+        'bybitperps': 'magenta',
+        'binanceperps': 'green',
+        'binancespot': 'blue'
+    }
+
+    def update(frame):
+        ax.clear()
+        ax.set_facecolor('#2a2a2a')
+        for key in target_keys:
+            df = screener.cvd_data.get(key)
+            if df is not None and not df.empty:
+                exchange = key.split(':')[0]
+                color = exchange_colors.get(exchange, 'white')
+                for timeframe in ['cvd_1m', 'cvd_15m']:
+                    if timeframe in df.columns:
+                        df_time = df[[timeframe]].dropna()
+                        if not df_time.empty:
+                            label = f'{exchange} {timeframe.replace("cvd_", "")}'
+                            linestyle = '--' if '1m' in timeframe else '-'
+                            ax.plot(df_time.index, df_time[timeframe], label=label, color=color, linestyle=linestyle)
+        if not ax.has_data():
+            ax.text(0.5, 0.5, "Waiting for trade data...", ha='center', va='center', transform=ax.transAxes, color='white')
+        else:
+            ax.set_title(f"CVD for {target_keys[0].split(':')[1]}", color='white')
+            ax.set_xlabel("Time", color='white')
+            ax.set_ylabel("Cumulative Volume Delta", color='white')
+            ax.legend(facecolor='#1a1a1a', edgecolor='white', labelcolor='white')
+            ax.tick_params(axis='x', rotation=45, colors='white')
+            ax.tick_params(axis='y', colors='white')
+            ax.grid(True, linestyle='--', alpha=0.3, color='gray')
+            ax.autoscale(enable=True, axis='both', tight=True)
+        plt.tight_layout()
+
+    ani = FuncAnimation(fig, update, interval=1000, blit=False)
+    plt.show(block=True)
+    stop_event.set()
+
 async def command_loop(screener):
+    # Display welcome message with typing animation (plain text)
+    typing_animation("Welcome to Matt Screener!")
+    
+    # Display donation message at startup in green
+    donation_message = (
+        "Please consider donating to the project! We need servers on CDN & proxy data. Anything helps!\n"
+        "BTC: 3EXZay6KVyRNFwRPoa3xrqCWUwek6gaD8X\n"
+        "USDC (ERC20): 0xd8fDECE91d300630c3683380C1C2425af0083723"
+    )
+    print(colored(donation_message, fg='green'))
+
+    # Display help menu once in yellow
+    help_message = (
+        "\nCommands:\n"
+        " sources <htx|coinbase|bybitperps|binanceperps|binancespot|all> - Set the data source(s).\n"
+        " info <pair>                   - Show info for a specific pair.\n"
+        " info funding up|down          - Show funding ranking.\n"
+        " display <metric>              - Continuously display all metrics sorted by the given metric.\n"
+        " displayfull <metric>          - Full-screen display sorted by the given metric.\n"
+        " display oi                    - Display open interest ranking.\n"
+        " tape <pair|all>               - Start live tape feed for a pair or all pairs.\n"
+        " tape stop                     - Stop the live tape feed.\n"
+        " displayfull stop              - Stop the full-screen display.\n"
+        " mmscan                        - Start scanning market conditions.\n"
+        " mmscan stop                   - Stop the market conditions scan.\n"
+        " cvdplot <pair>                - Start real-time CVD plot with 15m and 1m rolling averages.\n"
+        " cvdplot stop                  - Stop the real-time CVD plot.\n"
+        " proxy <usa|japan> <number|best> - Set proxy for the given region.\n"
+        " proxy list                    - List available proxies with ping times.\n"
+        " proxy off                     - Disable the current proxy.\n"
+        " exit                          - Exit the screener.\n"
+    )
+    print(colored(help_message, fg='yellow'))
+
     loop = asyncio.get_event_loop()
     display_task = None
     full_display_task = None
     oi_task = None
     tape_task = None
     mmscan_task = None
+    cvd_plot_thread_task = None
+    cvd_stop_event = None
     full_disp_stop_event = None
     mmscan_stop_event = None
     try:
@@ -953,19 +1072,19 @@ async def command_loop(screener):
             if parts[0] == 'help':
                 print(colored("\nCommands:", fg='cyan', style='bold'))
                 print(" sources <htx|coinbase|bybitperps|binanceperps|binancespot|all> - Set the data source(s).")
-                print(" info <pair>                   - Show info for a specific pair. (Prefix with source if needed: bybitperps:BTC/USDT)")
-                print(" info funding up|down          - Show funding ranking (up: highest first, down: lowest first).")
+                print(" info <pair>                   - Show info for a specific pair.")
+                print(" info funding up|down          - Show funding ranking.")
                 print(" display <metric>              - Continuously display all metrics sorted by the given metric.")
-                print("    (Valid metrics: price, change_5m_up, change_5m_down, tps, tps_5m, spread,")
-                print("     funding, vol_24h, volatility, oi, oi_change_1h, volume_delta_1h)")
-                print(" displayfull <metric>          - Full-screen display (fills window, scrollable) sorted by the given metric.")
-                print(" display oi                    - Display open interest ranking (auto-updating).")
-                print(" tape <pair|all>               - Start live tape feed for a pair or all pairs. (Prefix pair with source if desired)")
+                print(" displayfull <metric>          - Full-screen display sorted by the given metric.")
+                print(" display oi                    - Display open interest ranking.")
+                print(" tape <pair|all>               - Start live tape feed for a pair or all pairs.")
                 print(" tape stop                     - Stop the live tape feed.")
                 print(" displayfull stop              - Stop the full-screen display.")
-                print(" mmscan                        - Start continuously scanning market conditions (full-screen, non-scrolling).")
+                print(" mmscan                        - Start scanning market conditions.")
                 print(" mmscan stop                   - Stop the market conditions scan.")
-                print(" proxy <usa|japan> <number|best> - Set proxy for the given region by number or choose the best connection.")
+                print(" cvdplot <pair>                - Start real-time CVD plot with 15m and 1m rolling averages.")
+                print(" cvdplot stop                  - Stop the real-time CVD plot.")
+                print(" proxy <usa|japan> <number|best> - Set proxy for the given region.")
                 print(" proxy list                    - List available proxies with ping times.")
                 print(" proxy off                     - Disable the current proxy.")
                 print(" exit                          - Exit the screener.\n")
@@ -1044,6 +1163,45 @@ async def command_loop(screener):
                     mmscan_task = asyncio.create_task(asyncio.to_thread(curses_market_conditions_scan, screener, mmscan_stop_event))
                 else:
                     print(colored("Invalid mmscan command.", fg='red'))
+            elif parts[0] == 'cvdplot':
+                if len(parts) == 2 and parts[1].lower() == 'stop':
+                    if cvd_plot_thread_task is not None and cvd_stop_event is not None:
+                        cvd_stop_event.set()
+                        cvd_plot_thread_task.join()
+                        cvd_plot_thread_task = None
+                        cvd_stop_event = None
+                        print(colored("CVD plot stopped.", fg='yellow'))
+                    else:
+                        print(colored("No CVD plot is running.", fg='red'))
+                elif len(parts) == 2:
+                    pair = parts[1]
+                    if '/' in pair:
+                        base, quote = pair.split('/', 1)
+                        symbols_by_src = screener.find_symbols_by_base_quote(base, quote)
+                        target_keys = [f"{src}:{symbol}" for src, symbol in symbols_by_src.items()]
+                        if not target_keys:
+                            print(colored(f"No data available for {pair}", fg='red'))
+                            continue
+                    else:
+                        if ':' in pair:
+                            key = pair
+                            if key in screener.trade_history_cvd:
+                                target_keys = [key]
+                            else:
+                                print(colored(f"No trade data for {key}", fg='red'))
+                                continue
+                        else:
+                            print(colored("Please specify pair as base/quote (e.g., BTC/USDT) or src:symbol (e.g., htx:BTC/USDT)", fg='red'))
+                            continue
+                    if cvd_plot_thread_task is not None:
+                        cvd_stop_event.set()
+                        cvd_plot_thread_task.join()
+                    cvd_stop_event = threading.Event()
+                    cvd_plot_thread_task = threading.Thread(target=cvd_plot_thread, args=(screener, cvd_stop_event, target_keys))
+                    cvd_plot_thread_task.start()
+                    print(colored(f"Started real-time CVD plot for {pair}. Use 'cvdplot stop' to end.", fg='cyan'))
+                else:
+                    print(colored("Usage: cvdplot <pair> | cvdplot stop", fg='red'))
             elif parts[0] == 'proxy':
                 if len(parts) < 2:
                     print(colored("Usage: proxy <usa|japan> <number|best> | proxy list | proxy off", fg='red'))
@@ -1082,7 +1240,7 @@ async def command_loop(screener):
                 elif subcmd == 'off':
                     disable_proxy(screener)
                 else:
-                    print(colored("Invalid proxy command. Usage: proxy <usa|japan> <number|best> | proxy list | proxy off", fg='red'))
+                    print(colored("Invalid proxy command.", fg='red'))
             elif parts[0] == 'exit':
                 print("Exiting screener.")
                 if display_task is not None:
@@ -1097,14 +1255,20 @@ async def command_loop(screener):
                 if mmscan_task is not None:
                     mmscan_stop_event.set()
                     mmscan_task.cancel()
+                if cvd_plot_thread_task is not None and cvd_stop_event is not None:
+                    cvd_stop_event.set()
+                    cvd_plot_thread_task.join()
                 break
             else:
                 print(colored("Unknown command. Type 'help' for list of commands.", fg='red'))
     except Exception as e:
         print(colored(f"Command loop error: {e}", fg='red'))
+    finally:
+        if cvd_plot_thread_task is not None and cvd_stop_event is not None:
+            cvd_stop_event.set()
+            cvd_plot_thread_task.join()
 
 async def main():
-    # Do not connect to any exchange until the "sources" command is given.
     screener = MultiScreener()
     printer_task = asyncio.create_task(tape_printer(screener))
     try:
