@@ -996,6 +996,15 @@ async def tape_feed(pair, screener):
     except asyncio.CancelledError:
         print(colored("\nTape feed stopped.\n", fg='yellow'))
 
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+import time
+import threading
+
+# Add this at the top of your script (before any pandas operations) to suppress the FutureWarning
+pd.set_option('future.no_silent_downcasting', True)
+
 def cvd_plot_thread(screener, stop_event, target_keys):
     plt.style.use('ggplot')
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -1009,35 +1018,80 @@ def cvd_plot_thread(screener, stop_event, target_keys):
         'binancespot': 'blue'
     }
 
+    # For 5 updates per second, use 200ms intervals (1000ms / 5)
+    update_interval_ms = 200
+    last_update_time = time.time() * 1000  # in milliseconds
+
     def update(frame):
+        nonlocal last_update_time
+        current_time_ms = time.time() * 1000  # in milliseconds
+        # Only update if 200ms have passed
+        if current_time_ms - last_update_time < update_interval_ms:
+            return
+        last_update_time = current_time_ms
+
+        # Convert current time to pandas datetime
+        current_time = pd.to_datetime(current_time_ms, unit='ms')
+        start_time = current_time - pd.Timedelta(minutes=1)
+
         ax.clear()
         ax.set_facecolor('#2a2a2a')
+
+        has_data = False
+        all_cvd_values = []  # To collect all adjusted CVD values for autoscaling
+        all_timestamps = []  # To collect all timestamps for x-axis limits
+
         for key in target_keys:
             df = screener.cvd_data.get(key)
             if df is not None and not df.empty:
+                has_data = True
                 exchange = key.split(':')[0]
                 color = exchange_colors.get(exchange, 'white')
-                for timeframe in ['cvd_1m', 'cvd_15m']:
-                    if timeframe in df.columns:
-                        df_time = df[[timeframe]].dropna()
-                        if not df_time.empty:
-                            label = f'{exchange} {timeframe.replace("cvd_", "")}'
-                            linestyle = '--' if '1m' in timeframe else '-'
-                            ax.plot(df_time.index, df_time[timeframe], label=label, color=color, linestyle=linestyle)
-        if not ax.has_data():
-            ax.text(0.5, 0.5, "Waiting for trade data...", ha='center', va='center', transform=ax.transAxes, color='white')
-        else:
-            ax.set_title(f"CVD for {target_keys[0].split(':')[1]}", color='white')
-            ax.set_xlabel("Time", color='white')
-            ax.set_ylabel("Cumulative Volume Delta", color='white')
-            ax.legend(facecolor='#1a1a1a', edgecolor='white', labelcolor='white')
-            ax.tick_params(axis='x', rotation=45, colors='white')
-            ax.tick_params(axis='y', colors='white')
-            ax.grid(True, linestyle='--', alpha=0.3, color='gray')
-            ax.autoscale(enable=True, axis='both', tight=True)
+
+                # Filter data to the last 1 minute and resample to 200ms bins
+                df_window = df.loc[start_time:].resample('200ms').last().ffill()
+                
+                if not df_window.empty:
+                    # Reset CVD to start at 0 by subtracting the first value in the window
+                    adjusted_cvd = df_window['cvd'] - df_window['cvd'].iloc[0]
+                    
+                    # Plot the adjusted CVD
+                    label = f'{exchange} CVD'
+                    ax.plot(df_window.index, adjusted_cvd, label=label, color=color, linestyle='-')
+
+                    # Collect values for autoscaling
+                    all_cvd_values.extend(adjusted_cvd.dropna().values)
+                    all_timestamps.extend(df_window.index)
+
+        if not has_data:
+            ax.text(0.5, 0.5, "Waiting for trade data...", ha='center', va='center', 
+                    transform=ax.transAxes, color='white')
+        elif len(df_window) < 25:  # Rough check for sparse data
+            ax.text(0.5, 0.9, "Not enough data to display full line; showing available data.",
+                    ha='center', va='center', transform=ax.transAxes, color='yellow', fontsize=10)
+
+        ax.set_title(f"CVD for {target_keys[0].split(':')[1]}", color='white')
+        ax.set_xlabel("Time", color='white')
+        ax.set_ylabel("Cumulative Volume Delta", color='white')
+        ax.legend(facecolor='#1a1a1a', edgecolor='white', labelcolor='white')
+        ax.tick_params(axis='x', rotation=45, colors='white')
+        ax.tick_params(axis='y', colors='white')
+        ax.grid(True, linestyle='--', alpha=0.3, color='gray')
+
+        # Set x-axis limits to exactly the last 1 minute
+        if all_timestamps:
+            ax.set_xlim(start_time, current_time)
+            # Autoscale y-axis based on adjusted CVD values
+            if all_cvd_values:
+                y_min, y_max = min(all_cvd_values), max(all_cvd_values)
+                if y_max > y_min:  # Avoid division by zero
+                    buffer = (y_max - y_min) * 0.1  # 10% buffer
+                    ax.set_ylim(y_min - buffer, y_max + buffer)
+
         plt.tight_layout()
 
-    ani = FuncAnimation(fig, update, interval=1000, blit=False)
+    # Update every 50ms to check timing, but actual plotting limited to 200ms intervals
+    ani = FuncAnimation(fig, update, interval=50, blit=False)
     plt.show(block=True)
     stop_event.set()
 
