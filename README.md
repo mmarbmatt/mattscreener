@@ -1,3 +1,25 @@
+BEFORE INSTALLING, PLEASE OPEN CMD AND RUN THE FOLLOWING CMD TO INSTALL DEPEENDENCIES. IT WILL NOT WORK IF U DO NOT DO THIS:
+
+
+
+
+pip install ccxt colorama windows-curses matplotlib pandas requests
+
+
+
+THEN RUN WITH UPDATED PYTHON
+
+
+
+
+
+REEEEEEEEEEEEEE
+
+
+
+
+
+
 # mattscreener
 a spot and perp futures crypto currency screener
 
