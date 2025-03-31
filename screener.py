@@ -574,6 +574,10 @@ class MultiScreener:
                 await asyncio.gather(*tasks, return_exceptions=True)
             await asyncio.sleep(60)
 
+    # Track last rate limit message time to only show once per minute
+    RATE_LIMIT_MSG_COOLDOWN = 60
+    last_rate_limit_msg_time = 0
+
     async def fetch_data_for_symbol(self, src, symbol, semaphore):
         async with semaphore:
             exchange = self.exchanges.get(src)
@@ -655,7 +659,11 @@ class MultiScreener:
 
                 except ccxt.RateLimitExceeded:
                     wait_time = base_delay * (2 ** attempt) + random.uniform(0, 1)
-                    print(colored(f"[Rate Limited] Retrying {src}:{symbol} in {wait_time:.2f}s", fg='yellow'))
+                    # Show the rate limit message only once per minute
+                    now_t = time.time()
+                    if now_t - self.last_rate_limit_msg_time >= self.RATE_LIMIT_MSG_COOLDOWN:
+                        print(colored(f"[Rate Limited] Retrying {src}:{symbol} in {wait_time:.2f}s", fg='yellow'))
+                        self.last_rate_limit_msg_time = now_t
                     await asyncio.sleep(wait_time)
                 except ccxt.NetworkError as e:
                     print(colored(f"[Network Error] {src}:{symbol}: {e}", fg='red'))
@@ -821,6 +829,7 @@ async def fetch_and_print_trades(src, sym, exchange, last_trade_ids, feed_start,
                 return []
 
         async def fetch_liquidation():
+            # Removed searching for options; only attempt liquidation if it's a perp
             if src not in ['bybitperps', 'binanceperps']:
                 return []
             await screener.rate_limiters[src].acquire()
@@ -936,6 +945,54 @@ async def fetch_and_print_trades(src, sym, exchange, last_trade_ids, feed_start,
                 last_trade_ids[key] = trade_id
 
 async def tape_feed(pair, screener):
+    # Handle 'all' to feed from all pairs across all selected sources
+    if pair.lower() == 'all':
+        feed_sources = {}
+        feed_start = {}
+        for src in screener.selected_sources:
+            exchange = screener.exchanges.get(src)
+            if not exchange:
+                continue
+            feed_start[src] = exchange.milliseconds()
+            syms = screener.symbols.get(src, [])
+            if syms:
+                feed_sources[src] = syms
+        if not feed_sources:
+            print(colored("No valid sources available for tape feed (all).", fg='red'))
+            return
+
+        print(colored("Starting live tape feed for ALL pairs across selected sources:", fg='cyan', style='bold'))
+        for src, syms in feed_sources.items():
+            print(colored(f"  {src.upper()}: {len(syms)} symbols", fg='cyan'))
+        last_trade_ids = {}
+        for src, syms in feed_sources.items():
+            for s in syms:
+                last_trade_ids[f"{src}:{s}"] = None
+
+        semaphores = {
+            'coinbase': asyncio.Semaphore(5),
+            'htx': asyncio.Semaphore(50),
+            'bybitperps': asyncio.Semaphore(20),
+            'binanceperps': asyncio.Semaphore(50),
+            'binancespot': asyncio.Semaphore(50)
+        }
+
+        try:
+            while True:
+                tasks = []
+                for src, syms in feed_sources.items():
+                    exchange = screener.exchanges.get(src)
+                    for s in syms:
+                        tasks.append(
+                            fetch_and_print_trades(src, s, exchange, last_trade_ids, feed_start[src], semaphores[src], screener)
+                        )
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            print(colored("\nTape feed (all) stopped.\n", fg='yellow'))
+        return
+
+    # Otherwise, handle single-pair or single src:symbol
     if '/' in pair:
         base, quote = pair.split('/', 1)
         symbols_by_src = screener.find_symbols_by_base_quote(base, quote)
@@ -1134,7 +1191,8 @@ async def command_loop(screener):
     display_task = None
     full_display_task = None
     oi_task = None
-    tape_task = None
+    # Changed from single tape_task to a dict for multiple feeds
+    tape_tasks = {}
     mmscan_task = None
     cvd_plot_thread_task = None
     cvd_stop_event = None
@@ -1210,19 +1268,32 @@ async def command_loop(screener):
                 else:
                     print(colored("Invalid displayfull command.", fg='red'))
             elif parts[0] == 'tape':
-                if len(parts) == 2 and parts[1].lower() == 'stop':
-                    if tape_task is not None:
-                        tape_task.cancel()
-                        tape_task = None
-                        print(colored("Tape feed stopped.", fg='yellow'))
+                # tape <pair|all> or tape stop
+                if len(parts) == 2:
+                    sub_arg = parts[1].lower()
+                    if sub_arg == 'stop':
+                        if not tape_tasks:
+                            print(colored("No tape feeds are running.", fg='red'))
+                        else:
+                            for pair_key, task_obj in tape_tasks.items():
+                                task_obj.cancel()
+                            tape_tasks.clear()
+                            print(colored("All tape feeds stopped.", fg='yellow'))
+                    elif sub_arg == 'all':
+                        if 'all' in tape_tasks:
+                            print(colored("Tape feed for all pairs is already running.", fg='yellow'))
+                        else:
+                            tape_tasks['all'] = asyncio.create_task(tape_feed('all', screener))
+                            print(colored("Started tape feed for all pairs.", fg='cyan'))
                     else:
-                        print(colored("No tape feed is running.", fg='red'))
-                elif len(parts) == 2:
-                    if tape_task is not None:
-                        tape_task.cancel()
-                    tape_task = asyncio.create_task(tape_feed(parts[1], screener))
+                        pair_to_feed = parts[1]
+                        if pair_to_feed in tape_tasks:
+                            print(colored(f"Tape feed for {pair_to_feed} is already running.", fg='yellow'))
+                        else:
+                            tape_tasks[pair_to_feed] = asyncio.create_task(tape_feed(pair_to_feed, screener))
+                            print(colored(f"Started tape feed for {pair_to_feed}.", fg='cyan'))
                 else:
-                    print(colored("Invalid tape command.", fg='red'))
+                    print(colored("Invalid tape command. Use 'tape <pair>' or 'tape all' or 'tape stop'", fg='red'))
             elif parts[0] == 'mmscan':
                 if len(parts) == 2 and parts[1].lower() == 'stop':
                     if mmscan_task is not None:
@@ -1324,8 +1395,11 @@ async def command_loop(screener):
                     display_task.cancel()
                 if oi_task is not None:
                     oi_task.cancel()
-                if tape_task is not None:
-                    tape_task.cancel()
+                # Cancel all tape feeds
+                if tape_tasks:
+                    for _, task_obj in tape_tasks.items():
+                        task_obj.cancel()
+                    tape_tasks.clear()
                 if full_display_task is not None:
                     full_disp_stop_event.set()
                     full_display_task.cancel()
@@ -1341,9 +1415,13 @@ async def command_loop(screener):
     except Exception as e:
         print(colored(f"Command loop error: {e}", fg='red'))
     finally:
-        if cvd_plot_thread_task is not None and cvd_stop_event is not None:
-            cvd_stop_event.set()
-            cvd_plot_thread_task.join()
+        if screener.update_task is not None:
+            screener.update_task.cancel()
+        for ex in screener.exchanges.values():
+            try:
+                await ex.close()
+            except Exception as e:
+                print(colored(f"Error closing exchange: {e}", fg='red'))
 
 async def main():
     screener = MultiScreener()
